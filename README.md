@@ -393,3 +393,289 @@ This will back up the all files and folders in database/dump sql and html volume
 #### can run on a custom cron schedule
 
 ```BACKUP_CRON_EXPRESSION: '20 01 * * *'``` the UTC timezone.
+
+#
+phpmyadmin  | Site default-ssl already enabled
+phpmyadmin  | Site 000-default already disabled
+phpmyadmin  | AH00526: Syntax error on line 36 of /etc/apache2/sites-enabled/default-ssl.conf:
+#
+...
+services:
+
+    drupal:
+        depends_on:
+            database:
+                condition: service_healthy
+        image: drupal:${PHP_IMAGE_NAME}
+        container_name: drupal
+        networks:
+            - backend
+        volumes:
+            - 'html:${WEBSERVER_DOC_ROOT}'
+            - type: bind
+              source: ./php-fpm/php/conf.d/security.ini
+              target: '${PHP_INI_DIR_PREFIX}/php/conf.d/security.ini'
+            - type: bind
+              source: ./php-fpm/php-fpm.d/z-www.conf
+              target: '${PHP_INI_DIR_PREFIX}/php-fpm.d/z-www.conf'
+        hostname: drupal
+        restart: unless-stopped
+        ports:
+            - '9000:80'
+        links:
+            - database
+            - redis
+        healthcheck:
+            test: ["CMD-SHELL", "/bin/pidof php-fpm > /dev/null || exit 1"]
+            interval: 5s
+            timeout: 5s
+            retries: 50
+        environment:
+            TZ: '${LOCAL_TIMEZONE}'
+        labels:
+            - 'docker-volume-backup.stop-during-backup=true'
+        command: >
+            bash -c "if pecl install -p -- redis; then pecl install -o -f redis && rm -rf /tmp/pear && docker-php-ext-enable redis; fi; composer require drush/drush; composer require drupal/purge drupal/purge_purger_http drupal/redis; 
+            if [ ! -f \"${WEBSERVER_DOC_ROOT}/sites/default/settings.php\" ]; then install -m 777 ${WEBSERVER_DOC_ROOT}/sites/default/default.settings.php ${WEBSERVER_DOC_ROOT}/sites/default/settings.php && sed -i 's/#/\\/\\/#/g' ${WEBSERVER_DOC_ROOT}/sites/default/settings.php && 
+            echo -e \"\\n\\$$settings['trusted_host_patterns'] = [\\n\\t'^$$(echo \"${DOMAIN_NAME}\" | sed 's/\\./\\\\./g')$$',\\n\\t'^.+\\.$$(echo \"${DOMAIN_NAME}\" | sed 's/\\./\\\\./g')$$',\\n];\" >> ${WEBSERVER_DOC_ROOT}/sites/default/settings.php; 
+            mkdir -p -m 777 ${WEBSERVER_DOC_ROOT}/sites/default/files; fi; grep -qe 'date.timezone = ${LOCAL_TIMEZONE}' ${PHP_INI_DIR_PREFIX}/php/conf.d/security.ini || echo 'date.timezone = ${LOCAL_TIMEZONE}' >> ${PHP_INI_DIR_PREFIX}/php/conf.d/security.ini; docker-php-entrypoint 'php-fpm'"
+
+    webserver:
+        depends_on:
+            - varnish
+        image: nginx:stable
+        container_name: webserver
+        networks:
+            - backend
+            - frontend
+        volumes:
+            - 'html:${WEBSERVER_DOC_ROOT}'
+            - type: bind
+              source: ./webserver/nginx.conf
+              target: '${NGINX_PREFIX}/nginx.conf'
+            - type: bind
+              source: ./webserver/templates/nginx.conf.template
+              target: '${NGINX_PREFIX}/templates/default.conf.template'
+            - type: bind
+              source: ./webserver/ssl-option/options-ssl-nginx.conf
+              target: '${LETSENCRYPT_CONF_PREFIX}/options-ssl-nginx.conf'
+            - type: bind
+              source: ./ssl-conf.sh
+              target: '/tmp/ssl-conf.sh'
+            - 'certbot-etc:${LETSENCRYPT_CONF_PREFIX}'
+            - '/tmp/acme-challenge:/tmp/acme-challenge'
+        hostname: webserver
+        restart: unless-stopped
+        ports:
+            - '80:80'
+            - '443:443'
+            - '90:90'
+        links:
+            - drupal
+        environment:
+            NGINX_HOST: ${DOMAIN_NAME}
+            NGINX_PORT: 80
+            TZ: '${LOCAL_TIMEZONE}'
+        command: bash -c "/docker-entrypoint.sh nginx -v; sh /tmp/ssl-conf.sh '${DOMAIN_NAME}' '${LETSENCRYPT_CONF_PREFIX}' '${NGINX_PREFIX}'"
+
+    certbot:
+        depends_on:
+            - webserver
+        image: certbot/certbot:latest
+        container_name: certbot
+        networks:
+            - backend
+        volumes:
+            - 'certbot-etc:${LETSENCRYPT_CONF_PREFIX}'
+            - 'certbot-var:/var/lib/letsencrypt'
+            - '/tmp/acme-challenge:/tmp/acme-challenge'
+        restart: unless-stopped
+        healthcheck:
+            test: ["CMD-SHELL", "test -d ${LETSENCRYPT_CONF_PREFIX}/live/${DOMAIN_NAME} || exit 1"]
+            interval: 5s
+            timeout: 5s
+            retries: 20
+        environment:
+            TZ: '${LOCAL_TIMEZONE}'
+        entrypoint: /bin/sh -c "certbot certonly --webroot --webroot-path /tmp/acme-challenge --rsa-key-size 4096 --non-interactive --agree-tos --no-eff-email --force-renewal --email ${LETSENCRYPT_EMAIL} -d ${DOMAIN_NAME} -d www.${DOMAIN_NAME}; 
+            trap exit TERM; while :; do certbot renew --dry-run; sleep 12h & wait $${!}; done;"
+
+    phpmyadmin:
+        depends_on:
+            certbot:
+                condition: service_healthy
+        image: phpmyadmin:latest
+        container_name: phpmyadmin
+        networks:
+            - backend
+            - frontend
+        volumes:
+            - type: bind
+              source: ./phpmyadmin/apache2/sites-available/default-ssl.conf
+              target: '${APACHE_CONFDIR_PREFIX}/sites-available/default-ssl.conf'
+            - type: bind
+              source: ./phpmyadmin/apache2/ports.conf
+              target: '${APACHE_CONFDIR_PREFIX}/ports.conf'
+            - type: bind
+              source: ./phpmyadmin/ssl-option/options-ssl-apache.conf
+              target: '${LETSENCRYPT_CONF_PREFIX}/options-ssl-apache.conf'
+            - type: bind
+              source: ./phpmyadmin/config.user.inc.php
+              target: '${PMA_CONF_FOLDER}/config.user.inc.php'
+            - type: bind
+              source: ./phpmyadmin/php/conf.d/security.ini
+              target: '${PHP_INI_DIR_PREFIX}/php/conf.d/security.ini'
+            - 'certbot-etc:${LETSENCRYPT_CONF_PREFIX}'
+        hostname: phpmyadmin
+        restart: unless-stopped
+        ports:
+            - '9090:443'
+        links:
+            - database
+        environment:
+            PMA_HOST: 'database'
+            PMA_PMADB: 'phpmyadmin'
+            PMA_CONTROLUSER: '${PMA_CONTROLUSER}'
+            PMA_CONTROLPASS: '${PMA_CONTROLPASS}'
+            MYSQL_ROOT_PASSWORD: '${MYSQL_ROOT_PASSWORD}'
+            UPLOAD_LIMIT: '${PMA_UPLOAD_LIMIT}'
+            MEMORY_LIMIT: '${PMA_MEMORY_LIMIT}'
+            TZ: '${LOCAL_TIMEZONE}'
+        command: >
+            bash -c "echo ${PMA_HTPASSWD_USERNAME}:phpmyadmin:$$( printf \"%s:%s:%s\" \"${PMA_HTPASSWD_USERNAME}\" \"phpmyadmin\" \"${PMA_HTPASSWD_PASSWORD}\" | md5sum | awk '{print $$1}' ) > ${PMA_CONF_FOLDER}/.htpasswd 
+            && printf 'AuthType Digest\\nAuthName \"phpmyadmin\"\\nAuthDigestProvider file\\nAuthUserFile ${PMA_CONF_FOLDER}/.htpasswd\\nRequire valid-user\\n' > ${WEBSERVER_DOC_ROOT}/.htaccess && a2enmod auth_digest; 
+            mkdir -p ${WEBSERVER_DOC_ROOT}/../upload && chown www-data:www-data ${WEBSERVER_DOC_ROOT}/../upload && chmod a+w ${WEBSERVER_DOC_ROOT}/../upload; mkdir -p ${WEBSERVER_DOC_ROOT}/../save && chown www-data:www-data ${WEBSERVER_DOC_ROOT}/../save && chmod a+w ${WEBSERVER_DOC_ROOT}/../save; 
+            grep -qxF 'ServerName 127.0.0.1' ${APACHE_CONFDIR_PREFIX}/apache2.conf || echo -e '\\nServerName 127.0.0.1' >> ${APACHE_CONFDIR_PREFIX}/apache2.conf; grep -qe 'date.timezone = ${LOCAL_TIMEZONE}' ${PHP_INI_DIR_PREFIX}/php/conf.d/security.ini || echo 'date.timezone = ${LOCAL_TIMEZONE}' >> ${PHP_INI_DIR_PREFIX}/php/conf.d/security.ini; 
+            a2enmod ssl && a2ensite default-ssl && a2dissite 000-default && /docker-entrypoint.sh 'apache2-foreground'"
+
+    database:
+        image: ${DATABASE_IMAGE_NAME}:${DATABASE_VERSION}
+        container_name: database
+        networks:
+            - backend
+        volumes:
+            - 'db:/var/lib/mysql'
+            - 'db-backup-data:/tmp/backup'
+            - type: bind
+              source: ./database/conf.d/z-mysql.cnf
+              target: '${MYSQL_CONF_PREFIX}/z-mysql.cnf'
+            - 'phpmyadmin-sql:/docker-entrypoint-initdb.d'
+        hostname: database
+        restart: unless-stopped
+        ports:
+            - '3306:3306'
+        healthcheck:
+            test: ["CMD-SHELL", "${DATABASE_ADMIN_COMMANDLINE} ping --silent || exit 1"]
+            interval: 5s
+            timeout: 5s
+            retries: 50
+        environment:
+            MYSQL_ROOT_PASSWORD: '${MYSQL_ROOT_PASSWORD}'
+            MYSQL_DATABASE: '${DB_NAME}'
+            MYSQL_USER: '${DB_USER}'
+            MYSQL_PASSWORD: '${DB_PASSWORD}'
+            MYSQL_ALLOW_EMPTY_PASSWORD: 'No'
+            MYSQL_ROOT_HOST: '${MYSQL_ROOT_HOST}'
+            TZ: '${LOCAL_TIMEZONE}'
+        labels:
+            - "docker-volume-backup.stop-during-backup=true"
+            - "docker-volume-backup.archive-pre=/bin/sh -c 'mysqldump -uroot -p${MYSQL_ROOT_PASSWORD} --all-databases > /tmp/backup/db_backup_data.sql'"
+            - "docker-volume-backup.exec-label=database"
+        command: bash -c "${DATABASE_PACKAGE_MANAGER} && export PMA_CONTROLUSER=${PMA_CONTROLUSER} export PMA_CONTROLPASS=${PMA_CONTROLPASS} && envsubst '$$PMA_CONTROLUSER,$$PMA_CONTROLPASS' < /docker-entrypoint-initdb.d/create_tables.sql.template > /docker-entrypoint-initdb.d/create_tables.sql && docker-entrypoint.sh --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci"
+
+    redis:
+        image: redis:latest
+        container_name: redis
+        networks:
+            - backend
+        volumes:
+            - 'dtredis:/data'
+            - type: bind
+              source: ./redis
+              target: '${REDIS_CONF_PREFIX}/redis'
+        hostname: redis
+        sysctls:
+            - net.core.somaxconn=512
+        restart: unless-stopped
+        ports:
+            - '6379:6379'
+        environment:
+            ALLOW_EMPTY_PASSWORD: 'yes'
+            TZ: '${LOCAL_TIMEZONE}'
+        command: "redis-server ${REDIS_CONF_PREFIX}/redis/redis.conf"
+
+    varnish:
+        depends_on:
+            drupal:
+                condition: service_healthy
+        image: varnish:${VARNISH_VERSION}
+        container_name: varnish
+        networks:
+            - backend
+        volumes:
+            - type: bind
+              source: ./varnish/default.vcl
+              target: '${VARNISH_CONF_PREFIX}/default.vcl'
+        hostname: varnish
+        tmpfs:
+            - /var/lib/varnish:exec
+        restart: unless-stopped
+        ports:
+            - '8080:80'
+        environment:
+            VARNISH_SIZE: '${VARNISH_SIZE}'
+            TZ: '${LOCAL_TIMEZONE}'
+        command: "-a http=:8080,HTTP -p default_ttl=3600 -n /tmp/varnish_workdir"
+
+    backup:
+        image: offen/docker-volume-backup:latest
+        container_name: backup
+        networks:
+            - backend
+        volumes:
+            - 'html:/backup/html:ro'
+            - 'db:/backup/db:ro'
+            - 'db-backup-data:/backup/db-backup-data:ro'
+            - '/var/run/docker.sock:/var/run/docker.sock:ro'
+            - type: bind
+              source: ./backups
+              target: /archive
+        hostname: backup
+        restart: unless-stopped
+        environment:
+            BACKUP_CRON_EXPRESSION: '20 01 * * *'
+            BACKUP_FILENAME: 'backup-%Y-%m-%dT%H-%M-%S.tar.gz'
+            BACKUP_RETENTION_DAYS: '7'
+            EXEC_LABEL: 'database'
+            BACKUP_EXCLUDE_REGEXP: 'core|modules|\\.log$$'
+
+networks:
+    backend: null
+    frontend: null
+
+volumes:
+    html:
+        name: drupal-html
+        driver: local
+        driver_opts:
+            type: none
+            device: ${DIRECTORY_PATH}/drupal
+            o: bind
+    db:
+        name: ${DATABASE_CONT_NAME}-data
+    db-backup-data:
+        name: ${DATABASE_CONT_NAME}-backup-data
+    phpmyadmin-sql:
+        name: phpmyadmin-sql
+        driver: local
+        driver_opts:
+            type: none
+            device: ${DIRECTORY_PATH}/database/phpmyadmin/sql
+            o: bind
+    dtredis:
+        name: redis-data
+    certbot-etc:
+        external: true
+    certbot-var:
+        name: certbot-var
+...
